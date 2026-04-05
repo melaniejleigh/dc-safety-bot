@@ -352,10 +352,28 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                 pass
 
             has_fireworks = False
+            special_events = []   # "Ticket Offer" type promos (e.g. Pups in the Park)
+            giveaways = []        # "Giveaway" type promos
+
             for promo in game.get("promotions", []):
-                if "firework" in json.dumps(promo).lower():
+                promo_json = json.dumps(promo).lower()
+                if "firework" in promo_json:
                     has_fireworks = True
-                    break
+                    continue
+
+                offer_type = promo.get("offerType", "")
+                raw_name = promo.get("name", "")
+                # Strip boilerplate suffixes like "| SPECIAL TICKET PURCHASE REQUIRED"
+                clean_name = re.split(r"\s*\|\s*", raw_name)[0].strip()
+                description_text = promo.get("description", "")
+
+                if offer_type == "Ticket Offer" and clean_name:
+                    special_events.append(clean_name)
+                elif offer_type == "Giveaway" and clean_name:
+                    label = clean_name
+                    if description_text:
+                        label += f" ({description_text})"
+                    giveaways.append(label)
 
             # Only show home games — away games don't affect the neighborhood
             if "nationals" not in home.lower():
@@ -364,6 +382,19 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
             name = f"{away} @ {home}"
             if has_fireworks:
                 name += " + 🎆 Fireworks"
+            for se in special_events:
+                name += f" + 🎟️ {se}"
+
+            promo_lines = []
+            if giveaways:
+                promo_lines.append("🎁 Giveaway: " + "; ".join(giveaways))
+
+            description = "Nationals home game at Nationals Park."
+            if has_fireworks:
+                description += " **Fireworks after the game!**"
+            if promo_lines:
+                description += " " + " ".join(promo_lines)
+            description += " Expect traffic near 1345 S Capitol St SW."
 
             results.append({
                 "date": game_date,
@@ -373,11 +404,7 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                 "time": game_time,
                 "has_fireworks": has_fireworks,
                 "source": "MLB",
-                "description": (
-                    "Nationals game at Nationals Park."
-                    + (" **Fireworks after the game!**" if has_fireworks else "")
-                    + " Expect traffic near 1345 S Capitol St SW."
-                ),
+                "description": description,
             })
     log.info("MLB: found %d game(s) between %s and %s", len(results), start, end)
     return results
