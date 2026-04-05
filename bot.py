@@ -366,15 +366,32 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
 
 
 def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
-    """Events from Ticketmaster Discovery API for monitored venues."""
+    """Events from Ticketmaster Discovery API within radius of the building."""
     if not TICKETMASTER_API_KEY:
         log.info("No TICKETMASTER_API_KEY — skipping Ticketmaster")
         return []
 
-    # Single radius-based search — returns all ticketed events within TM_RADIUS_MILES
-    # of the building. Automatically covers Nationals Park, Audi Field, The Anthem,
-    # Capital One Arena, Navy Yard, and any other local venue without needing to
-    # name them explicitly.
+    # Words in event names that indicate a ticket add-on, not a real event.
+    JUNK_PATTERNS = [
+        "parking", "suite", "vip package", "post game pass", "post-game",
+        "pre-game pass", "visiting team", "ship fee", "print fee",
+        "service fee", "suites parking", "united globe", "devils backbone",
+    ]
+
+    # Venues already covered by the MLB Stats API — skip to avoid duplicates.
+    MLB_VENUES = {"nationals park", "oriole park", "t-mobile park"}
+
+    # Only show these Ticketmaster segments (skip Miscellaneous which is add-ons/packages).
+    ALLOWED_SEGMENTS = {"music", "sports", "arts & theatre", "film", "family"}
+
+    segment_emoji = {
+        "sports": "🏟️",
+        "music": "🎵",
+        "arts & theatre": "🎭",
+        "film": "🎬",
+        "family": "👨‍👩‍👧",
+    }
+
     params = {
         "apikey": TICKETMASTER_API_KEY,
         "latlong": f"{TARGET_LAT},{TARGET_LON}",
@@ -394,20 +411,38 @@ def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
         log.warning("Ticketmaster radius search error: %s", exc)
         return []
 
-    # Emoji by segment type
-    segment_emoji = {
-        "sports": "🏟️",
-        "music": "🎵",
-        "arts & theatre": "🎭",
-        "film": "🎬",
-        "miscellaneous": "🎪",
-    }
-
     results = []
+    # Track venue+date+time combos already added to avoid duplicate add-on listings
+    seen_slots: set[str] = set()
+
     for event in data.get("_embedded", {}).get("events", []):
         dates_info = event.get("dates", {}).get("start", {})
         event_date = dates_info.get("localDate", "")
         if not event_date:
+            continue
+
+        event_name = event.get("name", "Event")
+        name_lower = event_name.lower()
+
+        # Skip junk ticket add-ons
+        if any(pat in name_lower for pat in JUNK_PATTERNS):
+            continue
+
+        # Get segment and skip non-event types
+        segment = ""
+        try:
+            segment = event.get("classifications", [{}])[0].get("segment", {}).get("name", "").lower()
+        except (IndexError, KeyError):
+            pass
+        if segment and segment not in ALLOWED_SEGMENTS:
+            continue
+
+        # Get venue
+        event_venues = event.get("_embedded", {}).get("venues", [{}])
+        venue_name = event_venues[0].get("name", "Local Venue") if event_venues else "Local Venue"
+
+        # Skip venues already covered by MLB API
+        if venue_name.lower() in MLB_VENUES:
             continue
 
         local_time = dates_info.get("localTime", "")
@@ -419,21 +454,14 @@ def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
             except Exception:
                 event_time = local_time
 
-        event_name = event.get("name", "Event")
+        # Skip duplicate add-on listings for the same event slot
+        slot_key = f"{venue_name}|{event_date}|{event_time}"
+        if slot_key in seen_slots:
+            continue
+        seen_slots.add(slot_key)
 
-        # Get venue name from the event
-        event_venues = event.get("_embedded", {}).get("venues", [{}])
-        venue_name = event_venues[0].get("name", "Local Venue") if event_venues else "Local Venue"
-
-        # Pick emoji based on event segment
-        segment = ""
-        try:
-            segment = event.get("classifications", [{}])[0].get("segment", {}).get("name", "").lower()
-        except (IndexError, KeyError):
-            pass
         emoji = segment_emoji.get(segment, "📍")
-
-        has_fireworks = "firework" in event_name.lower()
+        has_fireworks = "firework" in name_lower
 
         results.append({
             "date": event_date,
@@ -446,7 +474,7 @@ def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
             "description": f"{event_name} at {venue_name}.",
         })
 
-    log.info("Ticketmaster radius search: %d event(s) within %d miles", len(results), TM_RADIUS_MILES)
+    log.info("Ticketmaster: %d event(s) within %d miles (after filtering)", len(results), TM_RADIUS_MILES)
     return results
 
 
