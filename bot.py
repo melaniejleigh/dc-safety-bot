@@ -384,6 +384,38 @@ async def on_ready():
 
 
 @bot.event
+async def on_message(message: discord.Message):
+    """Handle !test_fireworks command for manual testing."""
+    if message.author == bot.user:
+        return
+    if message.content.strip().lower() != "!test_fireworks":
+        return
+
+    log.info("!test_fireworks triggered by %s", message.author)
+    await message.channel.send("🔍 Scraping mlb.com for fireworks dates…")
+
+    dates = fetch_fireworks_dates()
+    if not dates:
+        # Post a sample embed so the format can be verified
+        await message.channel.send(
+            content="_(No fireworks dates found on mlb.com right now — showing sample embed.)_",
+            embed=embed_for_fireworks("2026-07-04", False),
+        )
+    else:
+        await message.channel.send(
+            content=f"Found **{len(dates)}** fireworks date(s): {', '.join(sorted(dates))}. "
+                    "Posting alert embed(s)…"
+        )
+        for event_date in sorted(dates)[:3]:   # cap at 3 to avoid spam
+            try:
+                d = datetime.strptime(event_date, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            is_today = d == datetime.utcnow().date()
+            await message.channel.send(embed=embed_for_fireworks(event_date, is_today))
+
+
+@bot.event
 async def on_error(event, *args, **kwargs):
     log.exception("Unhandled error in event %s", event)
 
