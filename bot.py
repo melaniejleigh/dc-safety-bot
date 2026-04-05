@@ -15,6 +15,7 @@ Venues monitored:
 """
 
 import os
+import re
 import json
 import sqlite3
 import logging
@@ -23,6 +24,7 @@ import math
 import requests
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
+from bs4 import BeautifulSoup
 
 import discord
 from discord.ext import tasks
@@ -86,42 +88,6 @@ ANNUAL_FIREWORKS = [
      "Expect **road closures and heavy traffic** near the Mall."),
 ]
 
-
-def _first_saturday_of_month(year: int, month: int) -> date:
-    """Return the first Saturday of a given month/year."""
-    d = date(year, month, 1)
-    # weekday(): Monday=0 … Saturday=5
-    days_until_sat = (5 - d.weekday()) % 7
-    return d + timedelta(days=days_until_sat)
-
-
-def fetch_known_local_events(start: date, end: date) -> list[dict]:
-    """Hardcoded recurring local events whose exact dates vary year-to-year."""
-    results = []
-    for year in (start.year, start.year + 1):
-        # Petalpalooza — National Cherry Blossom Festival fireworks at Navy Yard.
-        # Always the first Saturday of April (approximate; exact date set by festival).
-        # Main event + rain date (Sunday) both included.
-        petalpalooza_sat = _first_saturday_of_month(year, 4)
-        petalpalooza_sun = petalpalooza_sat + timedelta(days=1)
-        for event_date in (petalpalooza_sat, petalpalooza_sun):
-            if start <= event_date <= end:
-                label = "Rain Date — " if event_date == petalpalooza_sun else ""
-                results.append({
-                    "date": str(event_date),
-                    "name": f"🌸 Petalpalooza — Cherry Blossom Fireworks ({label}Navy Yard)",
-                    "venue": "The Yards Park, Navy Yard",
-                    "emoji": "🎆",
-                    "time": "08:30 PM",
-                    "has_fireworks": True,
-                    "source": "Known Annual",
-                    "description": (
-                        "Petalpalooza: the National Cherry Blossom Festival's official fireworks show "
-                        "at The Yards Park, ~0.4 miles from the building. Free event. "
-                        "Fireworks at 8:30 PM. Confirm exact date at capitalriverfront.org."
-                    ),
-                })
-    return results
 
 # Crime-type colour coding
 VIOLENT_OFFENSES = {
@@ -651,15 +617,102 @@ def fetch_eventbrite_events(start: date, end: date) -> list[dict]:
     return results
 
 
+def fetch_washingtonorg_events(start: date, end: date) -> list[dict]:
+    """Scrape washington.org for local events in Capitol Riverfront / SW Waterfront.
+
+    This catches free community events (Petalpalooza, festivals, markets) that
+    aren't on Ticketmaster.  We filter to two neighborhoods close to the building:
+      - Capitol Riverfront  (region 2148)
+      - Southwest Waterfront (region 1847)
+    """
+    # washington.org uses region IDs as checkbox params
+    NEIGHBORHOODS = {
+        "2148": "Capitol Riverfront",
+        "1847": "Southwest Waterfront",
+    }
+
+    base_url = "https://washington.org/find-dc-listings/events"
+    params = {
+        "field_date_value": str(start),
+        "field_date_end_value": str(end),
+    }
+    # Add region params (region[2148]=2148&region[1847]=1847)
+    for rid in NEIGHBORHOODS:
+        params[f"region[{rid}]"] = rid
+
+    try:
+        resp = requests.get(base_url, params=params, timeout=20,
+                            headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("washington.org scrape error: %s", exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+
+    for card in soup.select(".dcevent-content"):
+        # Title
+        title_el = card.select_one("h6.label, .label")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+
+        # Venue / sub-info
+        venue_el = card.select_one(".info .card-text")
+        venue = venue_el.get_text(strip=True) if venue_el else "Capitol Riverfront"
+
+        # Date range text (e.g. "Apr 16, 2026 - Dec 17, 2026")
+        date_el = card.select_one('[class*="date"]')
+        date_text = date_el.get_text(strip=True) if date_el else ""
+
+        # Try to extract a start date from the text
+        event_date = ""
+        m = re.search(r"([A-Z][a-z]{2})\s+(\d{1,2}),?\s+(\d{4})", date_text)
+        if m:
+            try:
+                parsed = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y")
+                event_date = str(parsed.date())
+            except ValueError:
+                pass
+
+        if not event_date:
+            # Fall back to "today" if we can't parse — it's still a current event
+            event_date = str(start)
+
+        # Link
+        link_el = card.find_parent("a") or card.select_one("a")
+        link = link_el["href"] if link_el and link_el.get("href") else ""
+        if link and not link.startswith("http"):
+            link = "https://washington.org" + link
+
+        has_fireworks = "firework" in title.lower()
+        emoji = "🎆" if has_fireworks else "📍"
+
+        results.append({
+            "date": event_date,
+            "name": title,
+            "venue": venue,
+            "emoji": emoji,
+            "time": "",
+            "has_fireworks": has_fireworks,
+            "source": "washington.org",
+            "description": f"{title} at {venue}. Details: {link}" if link else f"{title} at {venue}.",
+        })
+
+    log.info("washington.org: %d event(s) in Capitol Riverfront / SW Waterfront", len(results))
+    return results
+
+
 def fetch_all_events(start: date, end: date) -> list[dict]:
     """Gather events from all sources for a date range, deduped."""
     all_events = (
         fetch_mlb_games_and_fireworks(start, end)
         + fetch_ticketmaster_events(start, end)
         + fetch_annual_events(start, end)
-        + fetch_known_local_events(start, end)
         + fetch_nps_events(start, end)
         + fetch_eventbrite_events(start, end)
+        + fetch_washingtonorg_events(start, end)
     )
 
     # Deduplicate by key
