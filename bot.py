@@ -2,7 +2,10 @@
 DC Safety Bot
 Monitors crime incidents near 1345 S Capitol St SW, Washington DC
 and posts alerts to a Discord channel every 15 minutes.
-Also monitors for Nationals Park fireworks nights.
+Also monitors for fireworks events near the building:
+  - Nationals Park game promotions (MLB Stats API)
+  - National Mall annual events (July 4, New Year's Eve)
+  - NPS scheduled events on the National Mall (NPS Events API)
 """
 
 import os
@@ -47,6 +50,22 @@ MLB_STATS_API = (
     "?lang=en&sportIds=1&hydrate=game(promotions)"
     "&teamId=120&timeZone=America/New_York&scheduleTypes=games"
 )
+
+# NPS Events API — parkCode 'nama' = National Mall & Memorial Parks
+# Free key via https://www.nps.gov/subjects/developer/get-started.htm
+NPS_API_KEY = os.environ.get("NPS_API_KEY", "")
+NPS_EVENTS_API = "https://developer.nps.gov/api/v1/events?parkCode=nama&limit=50"
+
+# Known annual fireworks events near 1345 S Capitol St SW.
+# Each entry is (month, day, name, description).
+ANNUAL_FIREWORKS = [
+    (7, 4,  "Independence Day — National Mall",
+     "The National Mall fireworks display is one of the largest in the country. "
+     "Expect **road closures, Metro crowding, and loud noise** for several hours."),
+    (12, 31, "New Year's Eve — Washington Monument",
+     "Fireworks and light show at the Washington Monument at midnight. "
+     "Expect **road closures and heavy traffic** near the Mall."),
+]
 
 # Crime-type colour coding
 VIOLENT_OFFENSES = {
@@ -222,54 +241,135 @@ def embed_for_crime(record: dict) -> discord.Embed:
 
 
 # ── Fireworks check ───────────────────────────────────────────────────────────
-def fetch_fireworks_dates() -> list[str]:
-    """
-    Query the MLB Stats API for Nationals games whose promotions mention
-    'fireworks'. Returns list of date strings like '2026-04-05'.
-    """
+def fetch_mlb_fireworks_dates() -> list[dict]:
+    """Nationals game promotions that mention fireworks (MLB Stats API)."""
     today = datetime.utcnow().date()
     year = today.year
-    start = today.strftime("%Y-%m-%d")
-    end = f"{year}-12-31"
-
-    url = f"{MLB_STATS_API}&season={year}&startDate={start}&endDate={end}"
+    url = f"{MLB_STATS_API}&season={year}&startDate={today}&endDate={year}-12-31"
     try:
-        resp = requests.get(url, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"
-        })
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"})
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        log.warning("MLB Stats API fetch error: %s", exc)
+        log.warning("MLB Stats API error: %s", exc)
         return []
 
-    fireworks_dates = []
+    results = []
     for date_obj in data.get("dates", []):
         for game in date_obj.get("games", []):
             for promo in game.get("promotions", []):
-                promo_text = json.dumps(promo).lower()
-                if "firework" in promo_text:
-                    fireworks_dates.append(date_obj["date"])
-                    break  # one match per game is enough
+                if "firework" in json.dumps(promo).lower():
+                    results.append({
+                        "date": date_obj["date"],
+                        "name": promo.get("name", "Fireworks Night"),
+                        "source": "Nationals Park",
+                        "description": (
+                            "Fireworks are scheduled after tonight's Nationals game. "
+                            "Expect **heavy traffic and noise** near 1345 S Capitol St SW."
+                        ),
+                    })
+                    break
+    log.info("MLB fireworks dates: %s", [r["date"] for r in results])
+    return results
 
-    fireworks_dates = list(set(fireworks_dates))
-    log.info("Fireworks dates found via MLB API: %s", fireworks_dates)
-    return fireworks_dates
+
+def fetch_annual_fireworks_dates() -> list[dict]:
+    """Known annual fireworks events — July 4th and New Year's Eve."""
+    today = datetime.utcnow().date()
+    results = []
+    for month, day, name, description in ANNUAL_FIREWORKS:
+        try:
+            event_date = today.replace(month=month, day=day)
+        except ValueError:
+            continue
+        results.append({
+            "date": str(event_date),
+            "name": name,
+            "source": "Annual Event",
+            "description": description,
+        })
+    log.info("Annual fireworks dates: %s", [r["date"] for r in results])
+    return results
 
 
-def embed_for_fireworks(event_date: str, is_today: bool) -> discord.Embed:
-    when = "**TONIGHT**" if is_today else f"**TOMORROW** ({event_date})"
+def fetch_nps_fireworks_dates() -> list[dict]:
+    """NPS events at the National Mall that mention fireworks."""
+    if not NPS_API_KEY:
+        log.info("No NPS_API_KEY set — skipping NPS events check")
+        return []
+
+    today = datetime.utcnow().date()
+    url = f"{NPS_EVENTS_API}&api_key={NPS_API_KEY}&dateStart={today}&dateEnd={today + timedelta(days=30)}&q=fireworks"
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("NPS Events API error: %s", exc)
+        return []
+
+    results = []
+    for event in data.get("data", []):
+        title = event.get("title", "")
+        desc = event.get("description", "")
+        if "firework" not in (title + desc).lower():
+            continue
+        date_str = (event.get("dates") or [{}])[0].get("date", "")
+        if not date_str:
+            continue
+        results.append({
+            "date": date_str[:10],
+            "name": title or "National Mall Fireworks",
+            "source": "NPS / National Mall",
+            "description": (
+                "A fireworks event is scheduled at the National Mall. "
+                "Expect **road closures and heavy traffic** near 1345 S Capitol St SW."
+            ),
+        })
+    log.info("NPS fireworks dates: %s", [r["date"] for r in results])
+    return results
+
+
+def fetch_all_fireworks() -> list[dict]:
+    """Combine all fireworks sources and return upcoming dates (today + tomorrow)."""
+    today = datetime.utcnow().date()
+    tomorrow = today + timedelta(days=1)
+    relevant = []
+
+    all_events = (
+        fetch_mlb_fireworks_dates()
+        + fetch_annual_fireworks_dates()
+        + fetch_nps_fireworks_dates()
+    )
+
+    seen = set()
+    for event in all_events:
+        try:
+            d = datetime.strptime(event["date"], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if d not in (today, tomorrow):
+            continue
+        key = (event["date"], event["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        event["is_today"] = d == today
+        relevant.append(event)
+
+    return relevant
+
+
+def embed_for_fireworks(event: dict) -> discord.Embed:
+    is_today = event.get("is_today", False)
+    when = "**TONIGHT**" if is_today else f"**TOMORROW** ({event['date']})"
     embed = discord.Embed(
-        title="🎆 Nationals Park Fireworks Night!",
-        description=(
-            f"Fireworks are scheduled {when} at Nationals Park.\n\n"
-            "Expect **heavy traffic, road closures, and noise** near 1345 S Capitol St SW. "
-            "Plan accordingly!"
-        ),
+        title=f"🎆 {event['name']}",
+        description=f"Fireworks are scheduled {when}.\n\n{event['description']}\n\nPlan accordingly!",
         colour=discord.Colour.blue(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text="Source: mlb.com/nationals/schedule")
+    embed.set_footer(text=f"Source: {event['source']}")
     return embed
 
 
@@ -324,31 +424,16 @@ async def check_fireworks():
     if channel is None:
         return
 
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
-
-    dates = fetch_fireworks_dates()
-    for event_date in dates:
-        try:
-            d = datetime.strptime(event_date, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-
-        is_today = d == today
-        is_tomorrow = d == tomorrow
-
-        if not (is_today or is_tomorrow):
-            continue
-
-        alert_key = f"{event_date}_{'today' if is_today else 'tomorrow'}"
+    events = fetch_all_fireworks()
+    for event in events:
+        alert_key = f"{event['date']}_{event['name']}_{'today' if event['is_today'] else 'tomorrow'}"
         if fireworks_already_alerted(alert_key):
             continue
 
-        embed = embed_for_fireworks(event_date, is_today)
         try:
-            await channel.send(embed=embed)
+            await channel.send(embed=embed_for_fireworks(event))
             mark_fireworks_alerted(alert_key)
-            log.info("Posted fireworks alert for %s", event_date)
+            log.info("Posted fireworks alert: %s on %s", event['name'], event['date'])
         except discord.DiscordException as exc:
             log.error("Failed to send fireworks embed: %s", exc)
 
@@ -392,22 +477,39 @@ async def on_message(message: discord.Message):
         return
 
     log.info("!test_fireworks triggered by %s", message.author)
-    await message.channel.send("🔍 Scraping mlb.com for fireworks dates…")
+    await message.channel.send("🔍 Checking all fireworks sources (Nationals, National Mall, annual events)…")
 
-    dates = fetch_fireworks_dates()
-    if not dates:
-        await message.channel.send("No upcoming fireworks nights found in the Nationals schedule yet.")
+    # For testing: fetch ALL upcoming events, not just today/tomorrow
+    today = datetime.utcnow().date()
+    all_events = (
+        fetch_mlb_fireworks_dates()
+        + fetch_annual_fireworks_dates()
+        + fetch_nps_fireworks_dates()
+    )
+    # Filter to next 90 days so test is meaningful
+    upcoming = []
+    seen = set()
+    for e in all_events:
+        try:
+            d = datetime.strptime(e["date"], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if d < today:
+            continue
+        key = (e["date"], e["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        e["is_today"] = d == today
+        upcoming.append(e)
+    upcoming.sort(key=lambda x: x["date"])
+
+    if not upcoming:
+        await message.channel.send("No upcoming fireworks events found across any source.")
     else:
-        await message.channel.send(
-            f"Found **{len(dates)}** fireworks night(s): {', '.join(sorted(dates))}. Posting embed(s)…"
-        )
-        for event_date in sorted(dates)[:3]:   # cap at 3 to avoid spam
-            try:
-                d = datetime.strptime(event_date, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            is_today = d == datetime.utcnow().date()
-            await message.channel.send(embed=embed_for_fireworks(event_date, is_today))
+        summary = "\n".join(f"• **{e['date']}** — {e['name']} _(via {e['source']})_" for e in upcoming[:6])
+        await message.channel.send(f"Found **{len(upcoming)}** upcoming fireworks event(s):\n{summary}\n\nPosting sample embed…")
+        await message.channel.send(embed=embed_for_fireworks(upcoming[0]))
 
 
 @bot.event
