@@ -74,6 +74,15 @@ TM_VENUES = [
     {"keyword": "Capital One Arena", "stateCode": "DC", "emoji": "🏟️"},
     {"keyword": "Audi Field", "stateCode": "DC", "emoji": "⚽"},
     {"keyword": "The Anthem", "stateCode": "DC", "emoji": "🎵"},
+    {"keyword": "The Yards Park", "stateCode": "DC", "emoji": "🌸"},
+    {"keyword": "Capitol Riverfront", "stateCode": "DC", "emoji": "🌸"},
+]
+
+# Ticketmaster keyword searches — catch fireworks/festival events not tied to
+# a specific permanent venue (e.g. Petalpalooza at Navy Yard)
+TM_KEYWORD_SEARCHES = [
+    {"keyword": "Petalpalooza", "stateCode": "DC", "emoji": "🌸"},
+    {"keyword": "fireworks Washington DC", "stateCode": "DC", "emoji": "🎆"},
 ]
 
 # Known annual fireworks events near 1345 S Capitol St SW.
@@ -439,6 +448,64 @@ def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
             })
 
         log.info("Ticketmaster: %d event(s) at %s", len([r for r in results if r["venue"] == venue_info["keyword"]]), venue_info["keyword"])
+
+    # Keyword-only searches — for events like Petalpalooza that aren't at a
+    # permanent named venue but still happen very close to the building.
+    for kw_info in TM_KEYWORD_SEARCHES:
+        params = {
+            "apikey": TICKETMASTER_API_KEY,
+            "keyword": kw_info["keyword"],
+            "stateCode": kw_info["stateCode"],
+            "startDateTime": f"{start}T00:00:00Z",
+            "endDateTime": f"{end}T23:59:59Z",
+            "size": 20,
+            "sort": "date,asc",
+            "latlong": f"{TARGET_LAT},{TARGET_LON}",
+            "radius": "5",
+            "unit": "miles",
+        }
+        try:
+            resp = requests.get(TM_EVENTS_API, params=params, timeout=20,
+                                headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("Ticketmaster keyword search error for '%s': %s", kw_info["keyword"], exc)
+            continue
+
+        for event in data.get("_embedded", {}).get("events", []):
+            event_venues = event.get("_embedded", {}).get("venues", [{}])
+            venue_name = event_venues[0].get("name", kw_info["keyword"]) if event_venues else kw_info["keyword"]
+
+            dates_info = event.get("dates", {}).get("start", {})
+            event_date = dates_info.get("localDate", "")
+            local_time = dates_info.get("localTime", "")
+            event_time = ""
+            if local_time:
+                try:
+                    t = datetime.strptime(local_time, "%H:%M:%S")
+                    event_time = t.strftime("%I:%M %p")
+                except Exception:
+                    event_time = local_time
+
+            if not event_date:
+                continue
+
+            event_name = event.get("name", "Event")
+            has_fireworks = "firework" in event_name.lower() or "firework" in kw_info["keyword"].lower()
+
+            results.append({
+                "date": event_date,
+                "name": event_name,
+                "venue": venue_name,
+                "emoji": kw_info["emoji"],
+                "time": event_time,
+                "has_fireworks": has_fireworks,
+                "source": "Ticketmaster",
+                "description": f"{event_name} at {venue_name}. Near 1345 S Capitol St SW.",
+            })
+
+        log.info("Ticketmaster keyword '%s': %d result(s)", kw_info["keyword"], len(data.get("_embedded", {}).get("events", [])))
 
     return results
 
