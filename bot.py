@@ -6,13 +6,13 @@ Also monitors for Nationals Park fireworks nights.
 """
 
 import os
+import json
 import sqlite3
 import logging
 import asyncio
 import math
 import requests
 from datetime import datetime, timedelta, timezone
-from bs4 import BeautifulSoup
 
 import discord
 from discord.ext import tasks
@@ -41,8 +41,12 @@ DB_PATH = "alerts.db"
 CRIME_API = "https://data.dc.gov/resource/jwta-jx6e.json"
 CRIME_APP_TOKEN = ""  # optional – set SOCRATA_APP_TOKEN env var if throttled
 
-# Nationals schedule page
-NATS_SCHEDULE_URL = "https://www.mlb.com/nationals/schedule"
+# MLB Stats API — teamId 120 = Washington Nationals
+MLB_STATS_API = (
+    "https://statsapi.mlb.com/api/v1/schedule"
+    "?lang=en&sportIds=1&hydrate=game(promotions)"
+    "&teamId=120&timeZone=America/New_York&scheduleTypes=games"
+)
 
 # Crime-type colour coding
 VIOLENT_OFFENSES = {
@@ -220,40 +224,36 @@ def embed_for_crime(record: dict) -> discord.Embed:
 # ── Fireworks check ───────────────────────────────────────────────────────────
 def fetch_fireworks_dates() -> list[str]:
     """
-    Scrape the Nationals schedule page for games tagged with 'fireworks'.
-    Returns list of date strings like '2026-04-05'.
+    Query the MLB Stats API for Nationals games whose promotions mention
+    'fireworks'. Returns list of date strings like '2026-04-05'.
     """
+    today = datetime.utcnow().date()
+    year = today.year
+    start = today.strftime("%Y-%m-%d")
+    end = f"{year}-12-31"
+
+    url = f"{MLB_STATS_API}&season={year}&startDate={start}&endDate={end}"
     try:
-        resp = requests.get(NATS_SCHEDULE_URL, timeout=20, headers={
+        resp = requests.get(url, timeout=20, headers={
             "User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"
         })
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        data = resp.json()
     except Exception as exc:
-        log.warning("Fireworks schedule fetch error: %s", exc)
+        log.warning("MLB Stats API fetch error: %s", exc)
         return []
 
     fireworks_dates = []
-    # Look for any element whose text mentions "fireworks"
-    for tag in soup.find_all(string=lambda t: t and "firework" in t.lower()):
-        # Walk up to find a date attribute
-        parent = tag.parent
-        for _ in range(8):
-            if parent is None:
-                break
-            date_val = parent.get("data-date") or parent.get("datetime") or ""
-            if date_val and len(date_val) >= 10:
-                try:
-                    d = datetime.strptime(date_val[:10], "%Y-%m-%d").date()
-                    fireworks_dates.append(str(d))
-                except ValueError:
-                    pass
-                break
-            parent = parent.parent
+    for date_obj in data.get("dates", []):
+        for game in date_obj.get("games", []):
+            for promo in game.get("promotions", []):
+                promo_text = json.dumps(promo).lower()
+                if "firework" in promo_text:
+                    fireworks_dates.append(date_obj["date"])
+                    break  # one match per game is enough
 
-    # Deduplicate
     fireworks_dates = list(set(fireworks_dates))
-    log.info("Fireworks dates found: %s", fireworks_dates)
+    log.info("Fireworks dates found via MLB API: %s", fireworks_dates)
     return fireworks_dates
 
 
@@ -396,15 +396,10 @@ async def on_message(message: discord.Message):
 
     dates = fetch_fireworks_dates()
     if not dates:
-        # Post a sample embed so the format can be verified
-        await message.channel.send(
-            content="_(No fireworks dates found on mlb.com right now — showing sample embed.)_",
-            embed=embed_for_fireworks("2026-07-04", False),
-        )
+        await message.channel.send("No upcoming fireworks nights found in the Nationals schedule yet.")
     else:
         await message.channel.send(
-            content=f"Found **{len(dates)}** fireworks date(s): {', '.join(sorted(dates))}. "
-                    "Posting alert embed(s)…"
+            f"Found **{len(dates)}** fireworks night(s): {', '.join(sorted(dates))}. Posting embed(s)…"
         )
         for event_date in sorted(dates)[:3]:   # cap at 3 to avoid spam
             try:
