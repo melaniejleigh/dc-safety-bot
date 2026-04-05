@@ -69,6 +69,10 @@ NPS_EVENTS_API = "https://developer.nps.gov/api/v1/events?parkCode=nama&limit=50
 EVENTBRITE_API_KEY = os.environ.get("EVENTBRITE_API_KEY", "")
 EVENTBRITE_API = "https://www.eventbriteapi.com/v3/events/search/"
 
+# PoPville RSS — hyperlocal DC blog; Navy Yard category feed catches
+# Petalpalooza, fireworks alerts, neighborhood events, PSAs, etc.
+POPVILLE_RSS = "https://www.popville.com/category/locations/neighborhoods-navy-yard/feed/"
+
 # Ticketmaster Discovery API
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 TM_EVENTS_API = "https://app.ticketmaster.com/discovery/v2/events.json"
@@ -617,6 +621,76 @@ def fetch_eventbrite_events(start: date, end: date) -> list[dict]:
     return results
 
 
+def fetch_popville_events(start: date, end: date) -> list[dict]:
+    """Scan PoPville Navy Yard RSS feed for event/fireworks posts.
+
+    PoPville is a hyperlocal DC blog that posts heads-up alerts about
+    fireworks, festivals, road closures, and neighborhood events — often
+    the very same day they happen.  We look for posts that mention
+    keywords like 'fireworks', 'festival', 'event', 'concert', 'closure'.
+    """
+    EVENT_KEYWORDS = {
+        "fireworks", "firework", "festival", "petalpalooza", "concert",
+        "event", "closure", "road closure", "heads up", "psa",
+        "celebration", "parade", "marathon", "race", "block party",
+    }
+
+    try:
+        resp = requests.get(POPVILLE_RSS, timeout=20,
+                            headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("PoPville RSS error: %s", exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "xml")
+    results = []
+
+    for item in soup.find_all("item"):
+        title = item.find("title").get_text(strip=True) if item.find("title") else ""
+        link = item.find("link").get_text(strip=True) if item.find("link") else ""
+        pub_date_str = item.find("pubDate").get_text(strip=True) if item.find("pubDate") else ""
+        description = item.find("description").get_text(strip=True) if item.find("description") else ""
+
+        # Parse publish date
+        post_date = None
+        if pub_date_str:
+            try:
+                # RSS date format: "Sat, 04 Apr 2026 14:30:58 +0000"
+                dt = datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z")
+                post_date = dt.date()
+            except ValueError:
+                continue
+
+        if not post_date or post_date < start or post_date > end:
+            continue
+
+        # Only include posts that mention event-related keywords
+        searchable = (title + " " + description).lower()
+        if not any(kw in searchable for kw in EVENT_KEYWORDS):
+            continue
+
+        # Get categories for context
+        categories = [c.get_text(strip=True) for c in item.find_all("category")]
+
+        has_fireworks = "firework" in searchable
+        emoji = "🎆" if has_fireworks else "📰"
+
+        results.append({
+            "date": str(post_date),
+            "name": title[:120],
+            "venue": "Navy Yard (via PoPville)",
+            "emoji": emoji,
+            "time": "",
+            "has_fireworks": has_fireworks,
+            "source": "PoPville",
+            "description": f"{title[:120]}. {link}",
+        })
+
+    log.info("PoPville: %d relevant post(s) in date range", len(results))
+    return results
+
+
 def fetch_washingtonorg_events(start: date, end: date) -> list[dict]:
     """Scrape washington.org for local events in Capitol Riverfront / SW Waterfront.
 
@@ -712,6 +786,7 @@ def fetch_all_events(start: date, end: date) -> list[dict]:
         + fetch_annual_events(start, end)
         + fetch_nps_events(start, end)
         + fetch_eventbrite_events(start, end)
+        + fetch_popville_events(start, end)
         + fetch_washingtonorg_events(start, end)
     )
 
