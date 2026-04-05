@@ -1,11 +1,17 @@
 """
-DC Safety Bot
+Alert Bot — Camden Canines
 Monitors crime incidents near 1345 S Capitol St SW, Washington DC
-and posts alerts to a Discord channel every 15 minutes.
-Also monitors for fireworks events near the building:
-  - Nationals Park game promotions (MLB Stats API)
-  - National Mall annual events (July 4, New Year's Eve)
-  - NPS scheduled events on the National Mall (NPS Events API)
+and posts alerts to Discord. Also provides:
+  - Weekly event digest (Sundays at 7 PM ET)
+  - Day-of event reminders (8 AM ET)
+  - Ad hoc alerts for last-minute event additions
+
+Venues monitored:
+  - Nationals Park (MLB games, fireworks, concerts)
+  - Audi Field (DC United, events)
+  - Capital One Arena (Wizards, Capitals, concerts)
+  - The Anthem (concerts, shows)
+  - National Mall (NPS events, annual fireworks)
 """
 
 import os
@@ -15,7 +21,8 @@ import logging
 import asyncio
 import math
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import tasks
@@ -39,6 +46,7 @@ TARGET_LON = -77.0105
 RADIUS_M = 400  # metres
 
 DB_PATH = "alerts.db"
+ET = ZoneInfo("America/New_York")
 
 # DC Open Data – Crime Incidents (Socrata)
 CRIME_API = "https://data.dc.gov/resource/jwta-jx6e.json"
@@ -52,12 +60,23 @@ MLB_STATS_API = (
 )
 
 # NPS Events API — parkCode 'nama' = National Mall & Memorial Parks
-# Free key via https://www.nps.gov/subjects/developer/get-started.htm
 NPS_API_KEY = os.environ.get("NPS_API_KEY", "")
 NPS_EVENTS_API = "https://developer.nps.gov/api/v1/events?parkCode=nama&limit=50"
 
+# Ticketmaster Discovery API
+TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
+TM_EVENTS_API = "https://app.ticketmaster.com/discovery/v2/events.json"
+
+# Ticketmaster venue keywords — we search by keyword + stateCode
+# to avoid hardcoding IDs that might change.
+TM_VENUES = [
+    {"keyword": "Nationals Park", "stateCode": "DC", "emoji": "⚾"},
+    {"keyword": "Capital One Arena", "stateCode": "DC", "emoji": "🏟️"},
+    {"keyword": "Audi Field", "stateCode": "DC", "emoji": "⚽"},
+    {"keyword": "The Anthem", "stateCode": "DC", "emoji": "🎵"},
+]
+
 # Known annual fireworks events near 1345 S Capitol St SW.
-# Each entry is (month, day, name, description).
 ANNUAL_FIREWORKS = [
     (7, 4,  "Independence Day — National Mall",
      "The National Mall fireworks display is one of the largest in the country. "
@@ -93,6 +112,21 @@ def init_db():
             alerted_at TEXT NOT NULL
         )
     """)
+    # Track weekly digest contents so we can detect ad-hoc additions
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS digest_events (
+            digest_date TEXT NOT NULL,
+            event_key TEXT NOT NULL,
+            PRIMARY KEY (digest_date, event_key)
+        )
+    """)
+    # Track day-of reminders so we don't double-post
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS dayof_reminders (
+            event_key TEXT PRIMARY KEY,
+            reminded_at TEXT NOT NULL
+        )
+    """)
     con.commit()
     con.close()
     log.info("Database initialised at %s", DB_PATH)
@@ -112,7 +146,7 @@ def mark_sent(incident_id: str):
     cur = con.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO sent_alerts (id, alerted_at) VALUES (?, ?)",
-        (incident_id, datetime.utcnow().isoformat()),
+        (incident_id, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
     con.close()
@@ -134,7 +168,50 @@ def mark_fireworks_alerted(event_date: str):
     cur = con.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO fireworks_alerts (event_date, alerted_at) VALUES (?, ?)",
-        (event_date, datetime.utcnow().isoformat()),
+        (event_date, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit()
+    con.close()
+
+
+def save_digest_events(digest_date: str, event_keys: list[str]):
+    """Save which event keys were included in a weekly digest."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    for key in event_keys:
+        cur.execute(
+            "INSERT OR IGNORE INTO digest_events (digest_date, event_key) VALUES (?, ?)",
+            (digest_date, key),
+        )
+    con.commit()
+    con.close()
+
+
+def get_last_digest_event_keys() -> set[str]:
+    """Get event keys from the most recent digest."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT DISTINCT event_key FROM digest_events ORDER BY digest_date DESC")
+    keys = {row[0] for row in cur.fetchall()}
+    con.close()
+    return keys
+
+
+def dayof_already_reminded(event_key: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM dayof_reminders WHERE event_key = ?", (event_key,))
+    found = cur.fetchone() is not None
+    con.close()
+    return found
+
+
+def mark_dayof_reminded(event_key: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO dayof_reminders (event_key, reminded_at) VALUES (?, ?)",
+        (event_key, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
     con.close()
@@ -143,7 +220,7 @@ def mark_fireworks_alerted(event_date: str):
 # ── Geo helpers ───────────────────────────────────────────────────────────────
 def haversine_metres(lat1, lon1, lat2, lon2) -> float:
     """Return distance in metres between two lat/lon points."""
-    R = 6_371_000  # Earth radius in metres
+    R = 6_371_000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlam = math.radians(lon2 - lon1)
@@ -153,11 +230,7 @@ def haversine_metres(lat1, lon1, lat2, lon2) -> float:
 
 # ── Crime API ─────────────────────────────────────────────────────────────────
 def fetch_recent_crimes() -> list[dict]:
-    """
-    Pull crime incidents from DC Open Data for the last 24 h
-    and filter to those within RADIUS_M of TARGET_LAT/LON.
-    """
-    since = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
     params = {
         "$where": f"report_dat >= '{since}'",
         "$limit": 1000,
@@ -204,14 +277,12 @@ def embed_for_crime(record: dict) -> discord.Embed:
     dist_m = record.get("_distance_m", "?")
     shift = record.get("shift") or ""
 
-    # Parse timestamp
     try:
         dt = datetime.fromisoformat(report_dt_raw.replace("Z", "+00:00"))
         time_str = dt.strftime("%b %d, %Y %I:%M %p UTC")
     except Exception:
         time_str = report_dt_raw or "Unknown time"
 
-    # Colour by severity
     if offense in VIOLENT_OFFENSES:
         colour = discord.Colour.red()
         severity = "🔴 VIOLENT"
@@ -240,14 +311,17 @@ def embed_for_crime(record: dict) -> discord.Embed:
     return embed
 
 
-# ── Fireworks check ───────────────────────────────────────────────────────────
-def fetch_mlb_fireworks_dates() -> list[dict]:
-    """Nationals game promotions that mention fireworks (MLB Stats API)."""
-    today = datetime.utcnow().date()
-    year = today.year
-    url = f"{MLB_STATS_API}&season={year}&startDate={today}&endDate={year}-12-31"
+# ── Event fetching helpers ───────────────────────────────────────────────────
+def make_event_key(event: dict) -> str:
+    """Stable key for dedup: date + venue + name."""
+    return f"{event['date']}|{event['venue']}|{event['name']}"
+
+
+def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
+    """Nationals games (with fireworks flagging) from MLB Stats API."""
+    url = f"{MLB_STATS_API}&season={start.year}&startDate={start}&endDate={end}"
     try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"})
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -257,51 +331,150 @@ def fetch_mlb_fireworks_dates() -> list[dict]:
     results = []
     for date_obj in data.get("dates", []):
         for game in date_obj.get("games", []):
+            game_date = date_obj["date"]
+            away = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "TBD")
+            home = game.get("teams", {}).get("home", {}).get("team", {}).get("name", "Nationals")
+            game_time = ""
+            try:
+                gdt = datetime.fromisoformat(game.get("gameDate", "").replace("Z", "+00:00"))
+                game_time = gdt.astimezone(ET).strftime("%I:%M %p")
+            except Exception:
+                pass
+
+            has_fireworks = False
             for promo in game.get("promotions", []):
                 if "firework" in json.dumps(promo).lower():
-                    results.append({
-                        "date": date_obj["date"],
-                        "name": promo.get("name", "Fireworks Night"),
-                        "source": "Nationals Park",
-                        "description": (
-                            "Fireworks are scheduled after tonight's Nationals game. "
-                            "Expect **heavy traffic and noise** near 1345 S Capitol St SW."
-                        ),
-                    })
+                    has_fireworks = True
                     break
-    log.info("MLB fireworks dates: %s", [r["date"] for r in results])
+
+            name = f"{away} @ {home}"
+            if has_fireworks:
+                name += " + 🎆 Fireworks"
+
+            results.append({
+                "date": game_date,
+                "name": name,
+                "venue": "Nationals Park",
+                "emoji": "⚾",
+                "time": game_time,
+                "has_fireworks": has_fireworks,
+                "source": "MLB",
+                "description": (
+                    "Nationals game at Nationals Park."
+                    + (" **Fireworks after the game!**" if has_fireworks else "")
+                    + " Expect traffic near 1345 S Capitol St SW."
+                ),
+            })
+    log.info("MLB: found %d game(s) between %s and %s", len(results), start, end)
     return results
 
 
-def fetch_annual_fireworks_dates() -> list[dict]:
-    """Known annual fireworks events — July 4th and New Year's Eve."""
-    today = datetime.utcnow().date()
-    results = []
-    for month, day, name, description in ANNUAL_FIREWORKS:
-        try:
-            event_date = today.replace(month=month, day=day)
-        except ValueError:
-            continue
-        results.append({
-            "date": str(event_date),
-            "name": name,
-            "source": "Annual Event",
-            "description": description,
-        })
-    log.info("Annual fireworks dates: %s", [r["date"] for r in results])
-    return results
-
-
-def fetch_nps_fireworks_dates() -> list[dict]:
-    """NPS events at the National Mall that mention fireworks."""
-    if not NPS_API_KEY:
-        log.info("No NPS_API_KEY set — skipping NPS events check")
+def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
+    """Events from Ticketmaster Discovery API for monitored venues."""
+    if not TICKETMASTER_API_KEY:
+        log.info("No TICKETMASTER_API_KEY — skipping Ticketmaster")
         return []
 
-    today = datetime.utcnow().date()
-    url = f"{NPS_EVENTS_API}&api_key={NPS_API_KEY}&dateStart={today}&dateEnd={today + timedelta(days=30)}&q=fireworks"
+    results = []
+    for venue_info in TM_VENUES:
+        params = {
+            "apikey": TICKETMASTER_API_KEY,
+            "keyword": venue_info["keyword"],
+            "stateCode": venue_info["stateCode"],
+            "startDateTime": f"{start}T00:00:00Z",
+            "endDateTime": f"{end}T23:59:59Z",
+            "size": 50,
+            "sort": "date,asc",
+        }
+        try:
+            resp = requests.get(TM_EVENTS_API, params=params, timeout=20,
+                                headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("Ticketmaster API error for %s: %s", venue_info["keyword"], exc)
+            continue
+
+        for event in data.get("_embedded", {}).get("events", []):
+            # Only include events actually AT this venue
+            event_venues = [v.get("name", "") for v in event.get("_embedded", {}).get("venues", [])]
+            if not any(venue_info["keyword"].lower() in v.lower() for v in event_venues):
+                continue
+
+            event_date = ""
+            event_time = ""
+            dates_info = event.get("dates", {}).get("start", {})
+            event_date = dates_info.get("localDate", "")
+            local_time = dates_info.get("localTime", "")
+            if local_time:
+                try:
+                    t = datetime.strptime(local_time, "%H:%M:%S")
+                    event_time = t.strftime("%I:%M %p")
+                except Exception:
+                    event_time = local_time
+
+            if not event_date:
+                continue
+
+            event_name = event.get("name", "Event")
+            genre = ""
+            try:
+                classifications = event.get("classifications", [{}])
+                genre = classifications[0].get("genre", {}).get("name", "")
+                if genre == "Undefined":
+                    genre = classifications[0].get("segment", {}).get("name", "")
+            except (IndexError, KeyError):
+                pass
+
+            results.append({
+                "date": event_date,
+                "name": event_name,
+                "venue": venue_info["keyword"],
+                "emoji": venue_info["emoji"],
+                "time": event_time,
+                "genre": genre,
+                "has_fireworks": False,
+                "source": "Ticketmaster",
+                "description": f"{event_name} at {venue_info['keyword']}.",
+            })
+
+        log.info("Ticketmaster: %d event(s) at %s", len([r for r in results if r["venue"] == venue_info["keyword"]]), venue_info["keyword"])
+
+    return results
+
+
+def fetch_annual_events(start: date, end: date) -> list[dict]:
+    """Known annual fireworks events within the date range."""
+    results = []
+    for month, day, name, description in ANNUAL_FIREWORKS:
+        for year in (start.year, start.year + 1):
+            try:
+                event_date = date(year, month, day)
+            except ValueError:
+                continue
+            if start <= event_date <= end:
+                results.append({
+                    "date": str(event_date),
+                    "name": name,
+                    "venue": "National Mall",
+                    "emoji": "🎆",
+                    "time": "",
+                    "has_fireworks": True,
+                    "source": "Annual Event",
+                    "description": description,
+                })
+    return results
+
+
+def fetch_nps_events(start: date, end: date) -> list[dict]:
+    """NPS scheduled events at the National Mall."""
+    if not NPS_API_KEY:
+        log.info("No NPS_API_KEY — skipping NPS events")
+        return []
+
+    url = f"{NPS_EVENTS_API}&api_key={NPS_API_KEY}&dateStart={start}&dateEnd={end}"
     try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 DC-Safety-Bot/1.0"})
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -312,55 +485,180 @@ def fetch_nps_fireworks_dates() -> list[dict]:
     for event in data.get("data", []):
         title = event.get("title", "")
         desc = event.get("description", "")
-        if "firework" not in (title + desc).lower():
-            continue
         date_str = (event.get("dates") or [{}])[0].get("date", "")
         if not date_str:
             continue
+
+        has_fireworks = "firework" in (title + desc).lower()
+
         results.append({
             "date": date_str[:10],
-            "name": title or "National Mall Fireworks",
-            "source": "NPS / National Mall",
-            "description": (
-                "A fireworks event is scheduled at the National Mall. "
-                "Expect **road closures and heavy traffic** near 1345 S Capitol St SW."
-            ),
+            "name": title or "National Mall Event",
+            "venue": "National Mall",
+            "emoji": "🎆" if has_fireworks else "🏛️",
+            "time": "",
+            "has_fireworks": has_fireworks,
+            "source": "NPS",
+            "description": desc[:200] if desc else f"{title} at the National Mall.",
         })
-    log.info("NPS fireworks dates: %s", [r["date"] for r in results])
+    log.info("NPS: found %d event(s)", len(results))
     return results
 
 
-def fetch_all_fireworks() -> list[dict]:
-    """Combine all fireworks sources and return upcoming dates (today + tomorrow)."""
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
-    relevant = []
-
+def fetch_all_events(start: date, end: date) -> list[dict]:
+    """Gather events from all sources for a date range, deduped."""
     all_events = (
-        fetch_mlb_fireworks_dates()
-        + fetch_annual_fireworks_dates()
-        + fetch_nps_fireworks_dates()
+        fetch_mlb_games_and_fireworks(start, end)
+        + fetch_ticketmaster_events(start, end)
+        + fetch_annual_events(start, end)
+        + fetch_nps_events(start, end)
     )
 
+    # Deduplicate by key
     seen = set()
-    for event in all_events:
-        try:
-            d = datetime.strptime(event["date"], "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if d not in (today, tomorrow):
-            continue
-        key = (event["date"], event["name"])
+    unique = []
+    for e in all_events:
+        key = make_event_key(e)
         if key in seen:
             continue
         seen.add(key)
-        event["is_today"] = d == today
-        relevant.append(event)
+        unique.append(e)
 
-    return relevant
+    # Sort by date, then time
+    unique.sort(key=lambda e: (e["date"], e.get("time", "")))
+    return unique
+
+
+# ── Embed builders ───────────────────────────────────────────────────────────
+def build_weekly_digest_embed(events: list[dict], week_start: date) -> list[discord.Embed]:
+    """Build embed(s) for the weekly digest. Returns a list since Discord limits embed size."""
+    week_end = week_start + timedelta(days=6)
+    title = f"📅 Weekly Events — {week_start.strftime('%b %d')} to {week_end.strftime('%b %d, %Y')}"
+
+    if not events:
+        embed = discord.Embed(
+            title=title,
+            description="No events scheduled this week. Enjoy the quiet! 🤫",
+            colour=discord.Colour.light_grey(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="Alert Bot • Weekly Digest")
+        return [embed]
+
+    # Group events by date
+    by_date: dict[str, list[dict]] = {}
+    for e in events:
+        by_date.setdefault(e["date"], []).append(e)
+
+    lines = []
+    for event_date in sorted(by_date.keys()):
+        try:
+            d = datetime.strptime(event_date, "%Y-%m-%d").date()
+            day_label = d.strftime("%A, %b %d")
+        except ValueError:
+            day_label = event_date
+
+        lines.append(f"\n**{day_label}**")
+        for e in by_date[event_date]:
+            time_str = f" at {e['time']}" if e.get("time") else ""
+            fireworks_flag = " 🎆" if e.get("has_fireworks") else ""
+            lines.append(f"{e['emoji']} {e['name']}{time_str} — _{e['venue']}_{fireworks_flag}")
+
+    description = "\n".join(lines)
+
+    # Discord embed description limit is 4096 chars — split if needed
+    embeds = []
+    if len(description) <= 4000:
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=discord.Colour.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text=f"Alert Bot • {len(events)} event(s) this week")
+        embeds.append(embed)
+    else:
+        # Split into multiple embeds
+        chunk_size = 3800
+        chunks = []
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > chunk_size:
+                chunks.append(current)
+                current = line
+            else:
+                current += "\n" + line if current else line
+        if current:
+            chunks.append(current)
+
+        for i, chunk in enumerate(chunks):
+            embed = discord.Embed(
+                title=title if i == 0 else f"{title} (cont.)",
+                description=chunk,
+                colour=discord.Colour.blue(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            if i == len(chunks) - 1:
+                embed.set_footer(text=f"Alert Bot • {len(events)} event(s) this week")
+            embeds.append(embed)
+
+    return embeds
+
+
+def build_dayof_embed(events: list[dict], today: date) -> discord.Embed:
+    """Build embed for day-of reminders."""
+    day_label = today.strftime("%A, %B %d")
+    title = f"🔔 Today's Events — {day_label}"
+
+    lines = []
+    for e in events:
+        time_str = f" at {e['time']}" if e.get("time") else ""
+        fireworks_flag = " 🎆" if e.get("has_fireworks") else ""
+        lines.append(f"{e['emoji']} **{e['name']}**{time_str} — _{e['venue']}_{fireworks_flag}")
+
+    description = "\n".join(lines)
+    if any(e.get("has_fireworks") for e in events):
+        description += "\n\n🎆 **Fireworks tonight!** Plan for noise and traffic near the building."
+    else:
+        description += "\n\nPlan for possible traffic and noise near the building."
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        colour=discord.Colour.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Alert Bot • {len(events)} event(s) today")
+    return embed
+
+
+def build_adhoc_embed(event: dict) -> discord.Embed:
+    """Build embed for an ad-hoc new event alert."""
+    time_str = f" at {event['time']}" if event.get("time") else ""
+    fireworks_flag = " 🎆" if event.get("has_fireworks") else ""
+    try:
+        d = datetime.strptime(event["date"], "%Y-%m-%d").date()
+        date_label = d.strftime("%A, %b %d")
+    except ValueError:
+        date_label = event["date"]
+
+    embed = discord.Embed(
+        title=f"🆕 New Event Added — {event['name']}",
+        description=(
+            f"{event['emoji']} **{event['name']}**{time_str}{fireworks_flag}\n"
+            f"📍 {event['venue']} — {date_label}\n\n"
+            f"{event.get('description', '')}\n\n"
+            f"_This event was added after the last weekly digest._"
+        ),
+        colour=discord.Colour.purple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Alert Bot • Ad Hoc Alert • Source: {event['source']}")
+    return embed
 
 
 def embed_for_fireworks(event: dict) -> discord.Embed:
+    """Legacy fireworks embed for the !test_fireworks command."""
     is_today = event.get("is_today", False)
     when = "**TONIGHT**" if is_today else f"**TOMORROW** ({event['date']})"
     embed = discord.Embed(
@@ -380,7 +678,7 @@ intents.members = True
 intents.presences = True
 
 bot = discord.Client(intents=intents)
-scheduler = AsyncIOScheduler(timezone="UTC")
+scheduler = AsyncIOScheduler(timezone="America/New_York")
 
 
 async def check_crimes():
@@ -393,7 +691,6 @@ async def check_crimes():
     crimes = fetch_recent_crimes()
     new_count = 0
     for crime in crimes:
-        # Build a stable unique key
         ccn = crime.get("ccn") or ""
         report_dt = crime.get("report_dat") or crime.get("reportdatetime") or ""
         block = crime.get("block") or crime.get("blocksiteaddress") or ""
@@ -408,7 +705,7 @@ async def check_crimes():
             await channel.send(embed=embed)
             mark_sent(uid)
             new_count += 1
-            await asyncio.sleep(0.5)  # avoid rate-limit bursts
+            await asyncio.sleep(0.5)
         except discord.DiscordException as exc:
             log.error("Failed to send crime embed: %s", exc)
 
@@ -418,47 +715,150 @@ async def check_crimes():
         log.info("No new incidents to post")
 
 
-async def check_fireworks():
-    log.info("Running fireworks check…")
+async def weekly_digest():
+    """Sunday 7 PM ET — post the week's event calendar."""
+    log.info("Running weekly digest…")
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel is None:
         return
 
-    events = fetch_all_fireworks()
-    for event in events:
-        alert_key = f"{event['date']}_{event['name']}_{'today' if event['is_today'] else 'tomorrow'}"
-        if fireworks_already_alerted(alert_key):
-            continue
+    now_et = datetime.now(ET)
+    # Next Monday through Sunday
+    week_start = (now_et + timedelta(days=1)).date()
+    week_end = week_start + timedelta(days=6)
 
+    events = fetch_all_events(week_start, week_end)
+    embeds = build_weekly_digest_embed(events, week_start)
+
+    # Save digest event keys for ad-hoc dedup
+    digest_date = str(now_et.date())
+    event_keys = [make_event_key(e) for e in events]
+    save_digest_events(digest_date, event_keys)
+
+    try:
+        for embed in embeds:
+            await channel.send(embed=embed)
+            await asyncio.sleep(0.5)
+        log.info("Posted weekly digest with %d event(s)", len(events))
+    except discord.DiscordException as exc:
+        log.error("Failed to send weekly digest: %s", exc)
+
+
+async def dayof_reminder():
+    """8 AM ET daily — remind about today's events."""
+    log.info("Running day-of reminder check…")
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel is None:
+        return
+
+    today = datetime.now(ET).date()
+    events = fetch_all_events(today, today)
+
+    if not events:
+        log.info("No events today — skipping day-of reminder")
+        return
+
+    # Only remind for events not yet reminded
+    new_events = []
+    for e in events:
+        key = make_event_key(e)
+        if not dayof_already_reminded(key):
+            new_events.append(e)
+            mark_dayof_reminded(key)
+
+    if not new_events:
+        log.info("All today's events already reminded")
+        return
+
+    embed = build_dayof_embed(new_events, today)
+    try:
+        await channel.send(embed=embed)
+        log.info("Posted day-of reminder for %d event(s)", len(new_events))
+    except discord.DiscordException as exc:
+        log.error("Failed to send day-of reminder: %s", exc)
+
+
+async def adhoc_check():
+    """Every 6 hours — check for newly added events not in the last digest."""
+    log.info("Running ad-hoc event check…")
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel is None:
+        return
+
+    now_et = datetime.now(ET)
+    today = now_et.date()
+    # Look ahead through the end of the current digest week (next Sunday)
+    days_until_sunday = (6 - today.weekday()) % 7
+    if days_until_sunday == 0:
+        days_until_sunday = 7
+    end = today + timedelta(days=days_until_sunday)
+
+    events = fetch_all_events(today, end)
+    digest_keys = get_last_digest_event_keys()
+
+    if not digest_keys:
+        # No digest has been sent yet — skip ad-hoc
+        log.info("No previous digest found — skipping ad-hoc check")
+        return
+
+    new_events = []
+    for e in events:
+        key = make_event_key(e)
+        if key not in digest_keys:
+            # Check it wasn't already ad-hoc alerted (reuse fireworks_alerts table)
+            adhoc_key = f"adhoc_{key}"
+            if not fireworks_already_alerted(adhoc_key):
+                new_events.append(e)
+                mark_fireworks_alerted(adhoc_key)
+
+    if not new_events:
+        log.info("No new ad-hoc events found")
+        return
+
+    for event in new_events:
         try:
-            await channel.send(embed=embed_for_fireworks(event))
-            mark_fireworks_alerted(alert_key)
-            log.info("Posted fireworks alert: %s on %s", event['name'], event['date'])
+            await channel.send(embed=build_adhoc_embed(event))
+            log.info("Posted ad-hoc alert: %s on %s", event["name"], event["date"])
+            await asyncio.sleep(0.5)
         except discord.DiscordException as exc:
-            log.error("Failed to send fireworks embed: %s", exc)
+            log.error("Failed to send ad-hoc alert: %s", exc)
 
 
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
-    # Schedule jobs
+    # Crime check — every 15 minutes
     scheduler.add_job(check_crimes, "interval", minutes=15, id="crime_check",
                       next_run_time=datetime.now(timezone.utc))
-    scheduler.add_job(check_fireworks, "interval", hours=6, id="fireworks_check",
-                      next_run_time=datetime.now(timezone.utc))
+
+    # Weekly digest — Sundays at 7 PM ET
+    scheduler.add_job(weekly_digest, "cron", day_of_week="sun", hour=19, minute=0,
+                      id="weekly_digest")
+
+    # Day-of reminder — 8 AM ET every day
+    scheduler.add_job(dayof_reminder, "cron", hour=8, minute=0,
+                      id="dayof_reminder")
+
+    # Ad-hoc check — every 6 hours (catches new events between digests)
+    scheduler.add_job(adhoc_check, "interval", hours=6, id="adhoc_check",
+                      next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5))
+
     scheduler.start()
-    log.info("Scheduler started — crime check every 15 min, fireworks every 6 h")
+    log.info("Scheduler started — crime:15m, digest:Sun 7pm, dayof:8am, adhoc:6h")
 
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
         try:
             await channel.send(
                 embed=discord.Embed(
-                    title="✅ DC Safety Bot is online",
+                    title="✅ Alert Bot is online",
                     description=(
-                        "Monitoring crime incidents within **400m of 1345 S Capitol St SW**.\n"
-                        "Checks run every **15 minutes**. Fireworks alerts also enabled."
+                        "Monitoring **crime** within 400m of 1345 S Capitol St SW (every 15 min)\n"
+                        "📅 **Weekly digest** Sundays at 7 PM\n"
+                        "🔔 **Day-of reminders** at 8 AM\n"
+                        "🆕 **Ad-hoc alerts** for last-minute additions\n\n"
+                        "Venues: Nationals Park, Audi Field, Capital One Arena, The Anthem, National Mall"
                     ),
                     colour=discord.Colour.green(),
                     timestamp=datetime.now(timezone.utc),
@@ -470,46 +870,85 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Handle !test_fireworks command for manual testing."""
+    """Handle test commands."""
     if message.author == bot.user:
         return
-    if message.content.strip().lower() != "!test_fireworks":
-        return
 
-    log.info("!test_fireworks triggered by %s", message.author)
-    await message.channel.send("🔍 Checking all fireworks sources (Nationals, National Mall, annual events)…")
+    content = message.content.strip().lower()
 
-    # For testing: fetch ALL upcoming events, not just today/tomorrow
-    today = datetime.utcnow().date()
-    all_events = (
-        fetch_mlb_fireworks_dates()
-        + fetch_annual_fireworks_dates()
-        + fetch_nps_fireworks_dates()
-    )
-    # Filter to next 90 days so test is meaningful
-    upcoming = []
-    seen = set()
-    for e in all_events:
-        try:
-            d = datetime.strptime(e["date"], "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if d < today:
-            continue
-        key = (e["date"], e["name"])
-        if key in seen:
-            continue
-        seen.add(key)
-        e["is_today"] = d == today
-        upcoming.append(e)
-    upcoming.sort(key=lambda x: x["date"])
+    if content == "!test_fireworks":
+        log.info("!test_fireworks triggered by %s", message.author)
+        await message.channel.send("🔍 Checking all fireworks sources…")
 
-    if not upcoming:
-        await message.channel.send("No upcoming fireworks events found across any source.")
-    else:
-        summary = "\n".join(f"• **{e['date']}** — {e['name']} _(via {e['source']})_" for e in upcoming[:6])
-        await message.channel.send(f"Found **{len(upcoming)}** upcoming fireworks event(s):\n{summary}\n\nPosting sample embed…")
-        await message.channel.send(embed=embed_for_fireworks(upcoming[0]))
+        today = datetime.now(ET).date()
+        all_events = (
+            fetch_mlb_games_and_fireworks(today, today + timedelta(days=90))
+            + fetch_annual_events(today, today + timedelta(days=365))
+            + fetch_nps_events(today, today + timedelta(days=30))
+        )
+        fireworks_events = [e for e in all_events if e.get("has_fireworks")]
+
+        seen = set()
+        unique = []
+        for e in fireworks_events:
+            key = make_event_key(e)
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
+        unique.sort(key=lambda x: x["date"])
+
+        if not unique:
+            await message.channel.send("No upcoming fireworks events found across any source.")
+        else:
+            summary = "\n".join(
+                f"• **{e['date']}** — {e['name']} _(via {e['source']})_"
+                for e in unique[:8]
+            )
+            await message.channel.send(
+                f"Found **{len(unique)}** upcoming fireworks event(s):\n{summary}"
+            )
+
+    elif content == "!test_digest":
+        log.info("!test_digest triggered by %s", message.author)
+        await message.channel.send("📅 Generating test weekly digest…")
+
+        now_et = datetime.now(ET)
+        week_start = (now_et + timedelta(days=1)).date()
+        week_end = week_start + timedelta(days=6)
+        events = fetch_all_events(week_start, week_end)
+
+        embeds = build_weekly_digest_embed(events, week_start)
+        for embed in embeds:
+            await message.channel.send(embed=embed)
+            await asyncio.sleep(0.5)
+        await message.channel.send(f"_(Test only — {len(events)} event(s) found, not saved to digest)_")
+
+    elif content == "!test_today":
+        log.info("!test_today triggered by %s", message.author)
+        await message.channel.send("🔔 Checking today's events…")
+
+        today = datetime.now(ET).date()
+        events = fetch_all_events(today, today)
+
+        if not events:
+            await message.channel.send("No events scheduled today.")
+        else:
+            embed = build_dayof_embed(events, today)
+            await message.channel.send(embed=embed)
+            await message.channel.send(f"_(Test only — {len(events)} event(s) found)_")
+
+    elif content == "!help":
+        help_embed = discord.Embed(
+            title="🤖 Alert Bot Commands",
+            description=(
+                "**!test_fireworks** — Show upcoming fireworks events\n"
+                "**!test_digest** — Preview next week's event digest\n"
+                "**!test_today** — Show today's events\n"
+                "**!help** — Show this help message"
+            ),
+            colour=discord.Colour.blurple(),
+        )
+        await message.channel.send(embed=help_embed)
 
 
 @bot.event
@@ -520,5 +959,5 @@ async def on_error(event, *args, **kwargs):
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    log.info("Starting DC Safety Bot…")
+    log.info("Starting Alert Bot…")
     bot.run(DISCORD_TOKEN, log_handler=None)
