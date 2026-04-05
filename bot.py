@@ -73,6 +73,9 @@ EVENTBRITE_API = "https://www.eventbriteapi.com/v3/events/search/"
 # Petalpalooza, fireworks alerts, neighborhood events, PSAs, etc.
 POPVILLE_RSS = "https://www.popville.com/category/locations/neighborhoods-navy-yard/feed/"
 
+# The Wharf DC events page — server-rendered with schema.org Event markup
+WHARF_EVENTS_URL = "https://www.wharfdc.com/upcoming-events/"
+
 # Ticketmaster Discovery API
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 TM_EVENTS_API = "https://app.ticketmaster.com/discovery/v2/events.json"
@@ -778,6 +781,85 @@ def fetch_washingtonorg_events(start: date, end: date) -> list[dict]:
     return results
 
 
+def fetch_wharf_events(start: date, end: date) -> list[dict]:
+    """Scrape The Wharf DC upcoming events page.
+
+    The page is server-rendered with schema.org Event markup, giving us clean
+    ISO datetimes from [property="startDate"] content attributes.
+    The Wharf (~1.2 miles away) hosts fireworks, festivals, live music, and
+    boat parades that are visible and audible from the building.
+    """
+    try:
+        resp = requests.get(WHARF_EVENTS_URL, timeout=20,
+                            headers={"User-Agent": "Mozilla/5.0 AlertBot/2.0"})
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("Wharf DC scrape error: %s", exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+
+    for article in soup.select('article.Summary[typeof="Event"]'):
+        # Name from schema.org property
+        name_el = article.select_one('[property="name"]')
+        if not name_el:
+            continue
+        name = name_el.get_text(strip=True)
+
+        # ISO start datetime from schema.org content attribute
+        start_el = article.select_one('[property="startDate"]')
+        if not start_el:
+            continue
+        start_dt_str = start_el.get("content", "")
+        if not start_dt_str:
+            continue
+
+        try:
+            start_dt = datetime.fromisoformat(start_dt_str)
+            event_date = str(start_dt.date())
+            event_time = start_dt.strftime("%I:%M %p").lstrip("0")
+        except ValueError:
+            continue
+
+        # Filter to date range
+        try:
+            ed = date.fromisoformat(event_date)
+        except ValueError:
+            continue
+        if ed < start or ed > end:
+            continue
+
+        # Location — strip the "map marker icon" SVG text
+        loc_el = article.select_one('[property="location"]')
+        venue = "The Wharf DC"
+        if loc_el:
+            venue_name_el = loc_el.select_one('[property="name"]')
+            if venue_name_el:
+                venue = venue_name_el.get_text(strip=True)
+            else:
+                raw = loc_el.get_text(separator=" ", strip=True)
+                # Remove "map marker icon" prefix if present
+                venue = re.sub(r'^map\s+marker\s+icon\s*', '', raw, flags=re.I).strip() or "The Wharf DC"
+
+        has_fireworks = "firework" in name.lower()
+        emoji = "🎆" if has_fireworks else "📍"
+
+        results.append({
+            "date": event_date,
+            "name": name,
+            "venue": venue or "The Wharf DC",
+            "emoji": emoji,
+            "time": event_time,
+            "has_fireworks": has_fireworks,
+            "source": "The Wharf DC",
+            "description": f"{name} at {venue or 'The Wharf DC'}. {WHARF_EVENTS_URL}",
+        })
+
+    log.info("Wharf DC: %d event(s) in range", len(results))
+    return results
+
+
 def fetch_all_events(start: date, end: date) -> list[dict]:
     """Gather events from all sources for a date range, deduped."""
     all_events = (
@@ -787,6 +869,7 @@ def fetch_all_events(start: date, end: date) -> list[dict]:
         + fetch_nps_events(start, end)
         + fetch_eventbrite_events(start, end)
         + fetch_popville_events(start, end)
+        + fetch_wharf_events(start, end)
         + fetch_washingtonorg_events(start, end)
     )
 
