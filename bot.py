@@ -399,8 +399,7 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                 "date": game_date,
                 "name": name,
                 "venue": "Nationals Park",
-                # Suppress the leading emoji when promos already lead the name
-                "emoji": "" if special_events else "⚾",
+                "emoji": "",  # ⚾ is always embedded in the name via parts
                 "time": game_time,
                 "has_fireworks": has_fireworks,
                 "source": "MLB",
