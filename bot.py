@@ -379,14 +379,14 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
             if "nationals" not in home.lower():
                 continue
 
-            name = f"{away} @ {home}"
-            # Special events (Ticket Offers) go in the name
+            # Build name: special promos first, then the game, then giveaways
+            parts = []
             for se in special_events:
-                name += f" + 🎟️ {se}"
-            # Giveaways go in the name too (short form — no fan count)
+                parts.append(f"🎟️ {se}")
+            parts.append(f"⚾ {away} @ {home}")
             for giveaway in giveaways:
-                short = giveaway.split(" (")[0]
-                name += f" + 🎁 {short}"
+                parts.append(f"🎁 {giveaway.split(' (')[0]}")
+            name = " + ".join(parts)
 
             description = "Nationals home game at Nationals Park."
             if has_fireworks:
@@ -399,7 +399,8 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                 "date": game_date,
                 "name": name,
                 "venue": "Nationals Park",
-                "emoji": "⚾",
+                # Suppress the leading emoji when promos already lead the name
+                "emoji": "" if special_events else "⚾",
                 "time": game_time,
                 "has_fireworks": has_fireworks,
                 "source": "MLB",
