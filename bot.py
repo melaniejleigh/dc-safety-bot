@@ -70,7 +70,7 @@ TM_EVENTS_API = "https://app.ticketmaster.com/discovery/v2/events.json"
 # Search radius in miles around the building for Ticketmaster events.
 # 3 miles covers: Navy Yard, Nationals Park, Audi Field, The Anthem,
 # Capital One Arena — and any other local event automatically.
-TM_RADIUS_MILES = 3
+TM_RADIUS_MILES = 1  # ~1 mile covers Nationals Park, Navy Yard, Audi Field (0.5 not reliably supported by API)
 
 # Known annual fireworks events near 1345 S Capitol St SW.
 ANNUAL_FIREWORKS = [
@@ -343,6 +343,10 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                     has_fireworks = True
                     break
 
+            # Only show home games — away games don't affect the neighborhood
+            if "nationals" not in home.lower():
+                continue
+
             name = f"{away} @ {home}"
             if has_fireworks:
                 name += " + 🎆 Fireworks"
@@ -376,6 +380,8 @@ def fetch_ticketmaster_events(start: date, end: date) -> list[dict]:
         "parking", "suite", "vip package", "post game pass", "post-game",
         "pre-game pass", "visiting team", "ship fee", "print fee",
         "service fee", "suites parking", "united globe", "devils backbone",
+        "season deposit", "full season", "flex pack", "mini plan",
+        "group ticket", "premium seating",
     ]
 
     # Venues already covered by the MLB Stats API — skip to avoid duplicates.
