@@ -380,20 +380,19 @@ def fetch_mlb_games_and_fireworks(start: date, end: date) -> list[dict]:
                 continue
 
             name = f"{away} @ {home}"
-            if has_fireworks:
-                name += " + 🎆 Fireworks"
+            # Special events (Ticket Offers) go in the name
             for se in special_events:
                 name += f" + 🎟️ {se}"
-
-            promo_lines = []
-            if giveaways:
-                promo_lines.append("🎁 Giveaway: " + "; ".join(giveaways))
+            # Giveaways go in the name too (short form — no fan count)
+            for giveaway in giveaways:
+                short = giveaway.split(" (")[0]
+                name += f" + 🎁 {short}"
 
             description = "Nationals home game at Nationals Park."
             if has_fireworks:
                 description += " **Fireworks after the game!**"
-            if promo_lines:
-                description += " " + " ".join(promo_lines)
+            if giveaways:
+                description += " 🎁 Giveaway: " + "; ".join(giveaways) + "."
             description += " Expect traffic near 1345 S Capitol St SW."
 
             results.append({
@@ -947,7 +946,8 @@ def build_weekly_digest_embed(events: list[dict], week_start: date) -> list[disc
         lines.append(f"\n**{day_label}**")
         for e in by_date[event_date]:
             time_str = f" at {e['time']}" if e.get("time") else ""
-            fireworks_flag = " 🎆" if e.get("has_fireworks") else ""
+            # Only add trailing 🎆 if the name doesn't already contain it
+            fireworks_flag = " 🎆" if e.get("has_fireworks") and "🎆" not in e["name"] else ""
             lines.append(f"{e['emoji']} {e['name']}{time_str} — _{e['venue']}_{fireworks_flag}")
 
     description = "\n".join(lines)
@@ -999,7 +999,7 @@ def build_dayof_embed(events: list[dict], today: date) -> discord.Embed:
     lines = []
     for e in events:
         time_str = f" at {e['time']}" if e.get("time") else ""
-        fireworks_flag = " 🎆" if e.get("has_fireworks") else ""
+        fireworks_flag = " 🎆" if e.get("has_fireworks") and "🎆" not in e["name"] else ""
         lines.append(f"{e['emoji']} **{e['name']}**{time_str} — _{e['venue']}_{fireworks_flag}")
 
     description = "\n".join(lines)
