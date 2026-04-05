@@ -63,6 +63,10 @@ MLB_STATS_API = (
 NPS_API_KEY = os.environ.get("NPS_API_KEY", "")
 NPS_EVENTS_API = "https://developer.nps.gov/api/v1/events?parkCode=nama&limit=50"
 
+# Eventbrite API — catches free/community events not on Ticketmaster
+EVENTBRITE_API_KEY = os.environ.get("EVENTBRITE_API_KEY", "")
+EVENTBRITE_API = "https://www.eventbriteapi.com/v3/events/search/"
+
 # Ticketmaster Discovery API
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 TM_EVENTS_API = "https://app.ticketmaster.com/discovery/v2/events.json"
@@ -81,6 +85,43 @@ ANNUAL_FIREWORKS = [
      "Fireworks and light show at the Washington Monument at midnight. "
      "Expect **road closures and heavy traffic** near the Mall."),
 ]
+
+
+def _first_saturday_of_month(year: int, month: int) -> date:
+    """Return the first Saturday of a given month/year."""
+    d = date(year, month, 1)
+    # weekday(): Monday=0 … Saturday=5
+    days_until_sat = (5 - d.weekday()) % 7
+    return d + timedelta(days=days_until_sat)
+
+
+def fetch_known_local_events(start: date, end: date) -> list[dict]:
+    """Hardcoded recurring local events whose exact dates vary year-to-year."""
+    results = []
+    for year in (start.year, start.year + 1):
+        # Petalpalooza — National Cherry Blossom Festival fireworks at Navy Yard.
+        # Always the first Saturday of April (approximate; exact date set by festival).
+        # Main event + rain date (Sunday) both included.
+        petalpalooza_sat = _first_saturday_of_month(year, 4)
+        petalpalooza_sun = petalpalooza_sat + timedelta(days=1)
+        for event_date in (petalpalooza_sat, petalpalooza_sun):
+            if start <= event_date <= end:
+                label = "Rain Date — " if event_date == petalpalooza_sun else ""
+                results.append({
+                    "date": str(event_date),
+                    "name": f"🌸 Petalpalooza — Cherry Blossom Fireworks ({label}Navy Yard)",
+                    "venue": "The Yards Park, Navy Yard",
+                    "emoji": "🎆",
+                    "time": "08:30 PM",
+                    "has_fireworks": True,
+                    "source": "Known Annual",
+                    "description": (
+                        "Petalpalooza: the National Cherry Blossom Festival's official fireworks show "
+                        "at The Yards Park, ~0.4 miles from the building. Free event. "
+                        "Fireworks at 8:30 PM. Confirm exact date at capitalriverfront.org."
+                    ),
+                })
+    return results
 
 # Crime-type colour coding
 VIOLENT_OFFENSES = {
@@ -546,13 +587,79 @@ def fetch_nps_events(start: date, end: date) -> list[dict]:
     return results
 
 
+def fetch_eventbrite_events(start: date, end: date) -> list[dict]:
+    """Free/community events from Eventbrite within ~1 mile of the building."""
+    if not EVENTBRITE_API_KEY:
+        log.info("No EVENTBRITE_API_KEY — skipping Eventbrite")
+        return []
+
+    params = {
+        "location.latitude": str(TARGET_LAT),
+        "location.longitude": str(TARGET_LON),
+        "location.within": "1mi",
+        "start_date.range_start": f"{start}T00:00:00",
+        "start_date.range_end": f"{end}T23:59:59",
+        "expand": "venue",
+        "page_size": 50,
+    }
+    headers = {
+        "Authorization": f"Bearer {EVENTBRITE_API_KEY}",
+        "User-Agent": "Mozilla/5.0 AlertBot/2.0",
+    }
+
+    try:
+        resp = requests.get(EVENTBRITE_API, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Eventbrite API error: %s", exc)
+        return []
+
+    results = []
+    for event in data.get("events", []):
+        name = event.get("name", {}).get("text", "Event") or "Event"
+        start_info = event.get("start", {})
+        local_dt_str = start_info.get("local", "")
+        if not local_dt_str:
+            continue
+
+        try:
+            local_dt = datetime.fromisoformat(local_dt_str)
+            event_date = str(local_dt.date())
+            event_time = local_dt.strftime("%I:%M %p")
+        except Exception:
+            continue
+
+        venue_info = event.get("venue") or {}
+        venue_name = venue_info.get("name", "Local Venue") or "Local Venue"
+
+        has_fireworks = "firework" in name.lower()
+        is_free = event.get("is_free", False)
+
+        results.append({
+            "date": event_date,
+            "name": name,
+            "venue": venue_name,
+            "emoji": "🎆" if has_fireworks else ("🎟️" if not is_free else "📍"),
+            "time": event_time,
+            "has_fireworks": has_fireworks,
+            "source": "Eventbrite",
+            "description": f"{name} at {venue_name}.",
+        })
+
+    log.info("Eventbrite: %d event(s) within 1 mile", len(results))
+    return results
+
+
 def fetch_all_events(start: date, end: date) -> list[dict]:
     """Gather events from all sources for a date range, deduped."""
     all_events = (
         fetch_mlb_games_and_fireworks(start, end)
         + fetch_ticketmaster_events(start, end)
         + fetch_annual_events(start, end)
+        + fetch_known_local_events(start, end)
         + fetch_nps_events(start, end)
+        + fetch_eventbrite_events(start, end)
     )
 
     # Deduplicate by key
